@@ -1,6 +1,6 @@
 '''
     SASSIE  Copyright (C) 2011 Joseph E. Curtis
-    This program comes with ABSOLUTELY NO WARRANTY; 
+    This program comes with ABSOLUTELY NO WARRANTY;
     This is free software, and you are welcome to redistribute it under certain
     conditions; see http://www.gnu.org/licenses/gpl-3.0.html for details.
 '''
@@ -21,15 +21,14 @@ except AttributeError:
     numpy_include = numpy.get_numpy_include()
 
 # simple extension module
-gr = Extension(name="gr",sources=['./gr.f'],
-                   include_dirs = [numpy_include],
-                   )
+distance = Extension(name="distance",sources=['./distance.f'],
+                     include_dirs = [numpy_include],
+                     extra_compile_args=['-mavx'])
 
 # NumyTypemapTests setup
-setup(  name        = "gr",
-        description = "Module updates gr",
-        author      = "Joseph E. Curtis",
+setup(  name        = "distance",
+        description = "Module calculates the triangular distance matrix between coordinates",
+        author      = "Steven C. Howell",
         version     = "0.1",
-        ext_modules = [gr]
+        ext_modules = [distance]
         )
-

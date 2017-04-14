@@ -1,161 +1,206 @@
+import logging
 import os
 import sys
-import string
-import locale
-import numpy
-import math
-import random
-import matplotlib.pyplot as plt
+import time
+import numpy as np
+from scipy.spatial.distance import pdist
 import sasmol.sasmol as sasmol
 
 sys.path.append('./')
-import gr as fortran_gr
+try:
+    import gr as fortran_gr
+except ImportError:
+    pass
 
-def get_box_length_list(xst_file_name, stride, sigma=1):
+FORMAT = "%(asctime)-15s: %(message)s"
+logging.basicConfig(format=FORMAT, level=logging.DEBUG)
 
-    boxlength_list = []
 
-    boxlength_file = open(xst_file_name, 'r').readlines()
-    number_of_lines = len(boxlength_file)
-    print 'number_of_lines = ', number_of_lines
+def slow_update_gr(coor, box_length, gr, dr):
 
-    for line in boxlength_file:
-        this_line = string.split(line)
-        boxlength_list.append(locale.atof(this_line[1])*sigma)
+    n_atoms = len(coor)
 
-    return boxlength_list
+    for i in xrange(n_atoms - 1):
+        for j in xrange(i + 1, n_atoms):
 
-def update_gr(xcoor, ycoor, zcoor, box_length, nbins, natoms2, deltag):
+            dx = coor[i, 0] - coor[j, 0]
+            dy = coor[i, 1] - coor[j, 1]
+            dz = coor[i, 2] - coor[j, 2]
 
-    tgr = numpy.zeros(nbins, numpy.float)
+            dx -= box_length * ((dx / box_length).round())
+            dy -= box_length * ((dy / box_length).round())
+            dz -= box_length * ((dz / box_length).round())
 
-    for i in xrange(natoms2 - 1):
-        for j in xrange(i + 1, natoms2):
-
-            xr = xcoor[i] - xcoor[j]
-            yr = ycoor[i] - ycoor[j]
-            zr = zcoor[i] - zcoor[j]
-
-            xr = xr - box_length * ((xr / box_length).round())
-            yr = yr - box_length * ((yr / box_length).round())
-            zr = zr - box_length * ((zr / box_length).round())
-
-            r = math.sqrt((xr * xr) + (yr * yr) + (zr * zr))
+            r = np.sqrt((dx * dx) + (dy * dy) + (dz * dz))
 
             if (r < box_length / 2.0):
-                ig = int(r / deltag)
-                tgr[ig] = tgr[ig] + 2
-
-    return tgr
+                ig = int(r / dr)  # round down
+                gr[ig] += 2
 
 
-def main(pdb_file_name, dcd_file_name, xst_file_name, stride, sigma,
-         show=False):
+def calc_gr(coor, box_length, gr, dr):
 
-    m1 = sasmol.SasMol(0)
-    m1.read_pdb(pdb_file_name)
+    dx = pdist(coor[:, :1])
+    dy = pdist(coor[:, 1:2])
+    dz = pdist(coor[:, 2:])
 
-    if(dcd_file_name != False):
-        dcdfile = m1.open_dcd_read(dcd_file_name)
-        number_of_frames = dcdfile[2]
+    dx -= box_length * ((dx / box_length).round())
+    dy -= box_length * ((dy / box_length).round())
+    dz -= box_length * ((dz / box_length).round())
+
+    r = np.sqrt((dx * dx) + (dy * dy) + (dz * dz))
+
+    r_i = (r[r < box_length / 2.0] / dr).astype(int)  # round down
+    r_i_unique = np.unique(r_i, return_counts=True)
+    gr[r_i_unique[0]] += 2 * r_i_unique[1]
+
+
+def main(pdb_fname, run_log_fname, stride=1, sigma=1, dcd_fname=None,
+         n_skip=0, n_bins=333, gr_fname=''):
+
+    assert op.exists(pdb_fname), 'No such pdb file: {}'.format(pdb_fname)
+    box_mol = sasmol.SasMol(0)
+    box_mol.read_pdb(pdb_fname)
+
+    if dcd_fname:
+        assert op.exists(dcd_fname), 'No such dcd file: {}'.format(dcd_fname)
+        dcd_file = box_mol.open_dcd_read(dcd_fname)
+        n_frames = dcd_file[2]
     else:
-        number_of_frames = 1
+        n_frames = 1
 
-    print '> found ', number_of_frames, ' frames in dcd file'
+    run_log = np.loadtxt(run_log_fname)
 
-    if(xst_file_name != False):
-        box_length_list = get_box_length_list(xst_file_name, stride, sigma)
+    if len(run_log) != n_frames:
+        if len(run_log) == n_frames + 1:
+            run_log = run_log[:-1]
+            logging.warning('dcd file  had one more frame than the log file, '
+                         'discarding last line\ndcd_fname:\t{}\n'
+                         'run_log_fname:\t{}'.format(dcd_fname, run_log_fname))
+        else:
+            logging.error('mismatch between dcd and log file \n'
+                          'dcd_fname:\t{}\nrun_log_fname:\t{}'.format(
+                              dcd_fname, run_log_fname))
 
-    #box_length_list = [box_length]
+    n_atoms = box_mol.natoms()
+    n_gr = n_frames - n_skip  # number of frames, or g(r) curves, to averages
 
-    if len(box_length_list) != number_of_frames:
-        print 'len(box_length_list) = ', len(box_length_list)
-        print 'number of frames = ', number_of_frames
-        sys.exit()
+    box_length = run_log[:, 1] * sigma
+    print('box_length: (min, max) = ({}, {})'.format(box_length.min(),
+                                                     box_length.max()))
 
-    print 'box_length = ', box_length_list[0]
-    print 'box_length = ', box_length_list[-1]
+    gr_all = np.zeros((n_gr, n_bins))  # one g(r) for ecah dcd frame
+    gr = np.zeros((n_bins, 2))
 
-    min_box_length = min(box_length_list)
-    max_box_length = max(box_length_list)
+    # using the same r_grid for each frame
+    dr = box_length[n_skip:].max() / (2.0 * n_bins)  # delg in F&S
+    print(dr)
+    bin_index = np.arange(n_bins) + 1
+    rho = (n_atoms / (box_length ** 3.0)).reshape(-1, 1)  # frame specific density
 
-    print 'mininum box length = ', min_box_length
-    print 'maximum box length = ', max_box_length
+    r = (bin_index - 0.5) * dr
+    bin_volume = 4.0 / 3.0 * np.pi * ((r + dr / 2) ** 3 - (r - dr / 2) ** 3)
+    n_ideal = bin_volume * rho  # expected n for ideal gas
 
-    print '2 PI / boxlength = ', 2.0 * numpy.pi / min_box_length
+    if n_skip:
+        for i in xrange(n_skip):
+            # read and throw away these coordinates
+            box_mol.read_dcd_step(dcd_file, i)
 
-    box_length_sum = 0.0
+    tic = time.time()
+    for i in xrange(n_skip, n_frames):
+        sys.stdout.flush()
 
-    natoms = m1.natoms()
+        try:
+            box_mol.read_dcd_step(dcd_file, i)  #, no_print=True)
+        except NameError:
+            print('calculating g(r) for {}'.format(pdb_fname))
 
-    print 'number of atoms = ', natoms
+        coor = box_mol.coor()[0] * sigma
 
-    nbins = 1000
-    deltag = max_box_length / (2.0 * nbins)
+        # slow_update_gr(coor, box_length[i], gr_all[i-n_skip], dr)
+        # calc_gr(coor, box_length[i], gr_all[i-n_skip], dr)
+        fortran_gr.calc_gr(coor, box_length[i], gr_all[i-n_skip], dr)
 
-    print '> number of bins = ', nbins
-    print '> delta g(r) = ', deltag
+        gr_all[i-n_skip] /= n_ideal[i]  # normalize expected n for ideal gas
 
-    sum_gr = numpy.zeros(nbins, numpy.float)
-    fsum_gr = numpy.zeros(nbins, numpy.float)
-    gr = numpy.zeros(nbins, numpy.float)
-    fgr = numpy.zeros(nbins, numpy.float)
-    r = numpy.zeros(nbins, numpy.float)
+    toc = time.time() - tic
+    print('\nrun time: {} seconds'.format(toc))
+    box_mol.close_dcd_read(dcd_file[0])
+    gr[:, 0] = r
+    gr[:, 1] = np.mean(gr_all, axis=0) / n_atoms  # normalize by frames and atoms
+
+    if not gr_fname:
+        gr_fname = 'gr_{}.dat'.format(pdb_fname[:-4])
+
+    gr = gr[gr[:, 0] < box_length.min()/2]
+    np.savetxt(gr_fname, gr, fmt='%.14f')
+
+    return gr
+
+
+def plot_gr(gr, stride=1, show=False, plot_fname=''):
+    import matplotlib.pyplot as plt
+
+    gr_dat = np.loadtxt('argon_85K_gr.dat')
 
     fig = plt.figure()
     ax1 = fig.add_subplot(111)
+
     ax1.set_ylabel('g(r)')
     ax1.set_xlabel('r')
+    scale_factor = 1.0
+    ax1.plot(gr[:, 0], scale_factor * gr[:, 1], color='red', lw=2)
+    ax1.plot(gr_dat[:, 0], gr_dat[:, 1], color='blue', lw=2)
 
-    count = 0
-    for i in xrange(500,number_of_frames):
-        print i + 1,
-        sys.stdout.flush()
-        if(dcd_file_name != False):
-            m1.read_dcd_step(dcdfile, i)
-        xcoor = m1.coor()[0, :, 0]*sigma
-        ycoor = m1.coor()[0, :, 1]*sigma
-        zcoor = m1.coor()[0, :, 2]*sigma
+    if not plot_fname:
+        plot_fname = 'steve_gr.png'
 
-        ftgr = numpy.zeros(nbins, numpy.float)
-        ftgr = fortran_gr.update_gr(
-            xcoor, ycoor, zcoor, box_length_list[i], nbins, deltag)
-        fsum_gr = fsum_gr + ftgr
+    plt.savefig(plot_fname)
 
-        box_length_sum += box_length_list[i]
-        count += 1
-
-    average_box_length = box_length_sum / count
-
-    rho = natoms / (average_box_length**3.0)
-
-    for i in xrange(nbins):
-        r[i] = deltag * (i + 0.5)
-        vb = (((i + 1)**3) - (i**3)) * (deltag**3)
-        nid = (4.0 / 3.0) * numpy.pi * vb * rho
-        fgr[i] = fsum_gr[i] / (count * natoms * nid)
-
-    line, = ax1.plot(r, fgr, color='red', lw=3)
-
-    plt.savefig('test_500to1000_by' + str(stride) + '.png')
     if show:
         plt.show()
     else:
         plt.close('all')
 
-    with open('test' + str(stride) + '.dat', 'w') as outfile:
-        for i in range(len(r)):
-            outfile.write('%f\t%f\n' % (r[i], fgr[i]))
-
 
 if __name__ == '__main__':
-
+    import os.path as op
     sigma = 3.405
 
-    pdb_file_name = 'final.pdb'
-    dcd_file_name = 'run_0.dcd'
-    xst_file_name = 'box_length.txt'
+    test = False
 
-    stride = 1
+    if test:
+        run_path = './run2_output'
+        pdb_fname = 'run2.pdb'
+        dcd_fname = 'run2_last100.dcd'
+        xst_fname = 'box_length_last100.txt'
 
-    main(pdb_file_name, dcd_file_name, xst_file_name, stride, sigma)
+        pdb_fname = op.join(run_path, pdb_fname)
+        dcd_fname = op.join(run_path, dcd_fname)
+        xst_fname = op.join(run_path, xst_fname)
+
+        n_skip = 0
+
+        gr_fname = 'gr_fortran.dat'; plot_fname = 'gr_fortran.png'
+        # gr_fname = 'gr_python.dat'; plot_fname = 'gr_python.png'
+
+    else:
+        run_path = '../../simulations/lj_sphere_monomer/runs/p_0p14/run2_output'
+        pdb_fname = 'run2.pdb'
+        dcd_fname = 'run2.dcd'
+        xst_fname = 'box_length.txt'
+
+        pdb_fname = op.join(run_path, pdb_fname)
+        dcd_fname = op.join(run_path, dcd_fname)
+        xst_fname = op.join(run_path, xst_fname)
+
+        n_skip = 1000
+        # n_skip = 25000
+        # gr_fname = 'gr_1000_25001.dat'; plot_fname = 'gr_1000_25001.png'
+        gr_fname = 'gr_last_frame.dat'; plot_fname = 'gr_last_frame.png'
+
+    gr = main(pdb_fname, xst_fname, sigma=sigma, dcd_fname=dcd_fname,
+              n_skip=n_skip, gr_fname=gr_fname)
+
+    plot_gr(gr, plot_fname=plot_fname)
